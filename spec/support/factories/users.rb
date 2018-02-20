@@ -87,6 +87,7 @@ module CartoDB
       raise "User not valid: #{user.errors}" unless user.valid?
       # INFO: avoiding enable_remote_db_user
       user.save
+      user.create_api_keys
       load_user_functions(user)
       user
     end
