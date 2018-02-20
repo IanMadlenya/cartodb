@@ -156,37 +156,6 @@ Warden::Strategies.add(:api_authentication) do
   end
 end
 
-Warden::Strategies.add(:api_key) do
-  def valid?
-    params[:api_key].present?
-  end
-
-  # We don't want to store a session and send a response cookie
-  def store?
-    false
-  end
-
-  def authenticate!
-    begin
-      if (api_key = params[:api_key]) && api_key.present?
-        user_name = CartoDB.extract_subdomain(request)
-        if $users_metadata.HMGET("rails:users:#{user_name}", "map_key").first == api_key
-          user_id = $users_metadata.HGET "rails:users:#{user_name}", 'id'
-          return fail! if user_id.blank?
-          user = ::User[user_id]
-          success!(user)
-        else
-          return fail!
-        end
-      else
-        return fail!
-      end
-    rescue
-      return fail!
-    end
-  end
-end
-
 Warden::Strategies.add(:http_header_authentication) do
   include LoginEventTrigger
 
@@ -294,14 +263,8 @@ Warden::Strategies.add(:user_creation) do
 end
 
 module Carto::Api::AuthApiAuthentication
-  @@from_header = false
-
-  def self.from_header?
-    @@from_header
-  end
-
-  def self.from_header=(value)
-    @@from_header = value
+  def valid?
+    params[:api_key].present? || base64_auth.present?
   end
 
   def base64_auth
@@ -310,48 +273,73 @@ module Carto::Api::AuthApiAuthentication
   end
 
   def authenticate_user(require_master_key)
-    decoded_auth = Base64.decode64(base64_auth)
-    user_name, token = decoded_auth.split(':')
-    return fail! unless user_name == CartoDB.extract_subdomain(request)
-
-    user_id = $users_metadata.HGET("rails:users:#{user_name}", 'id')
-    api_key = Carto::ApiKey.where(user_id: user_id, token: token)
-    api_key = require_master_key ? api_key.master : api_key
-    return fail! unless api_key.exists?
-
-    Carto::Api::AuthApiAuthentication.from_header = true # TODO remove this when user's api_key field is removed
-    success!(::User[user_id])
+    if params[:api_key].present?
+      authenticate_with_param(require_master_key)
+    else
+      authenticate_with_header(require_master_key)
+    end
   rescue
     fail!
   end
 
   def request_api_key
     return @request_api_key if @request_api_key
-    if Carto::Api::AuthApiAuthentication.from_header?
+    if params[:api_key].present?
+      api_key = params[:api_key]
+      user_name = CartoDB.extract_subdomain(request)
+      user_id = $users_metadata.HGET "rails:users:#{user_name}", 'id'
+      @request_api_key = Carto::ApiKey.where(user_id: user_id, token: api_key)
+    else
       decoded_auth = Base64.decode64(base64_auth)
       user_name, token = decoded_auth.split(':')
       user_id = $users_metadata.HGET("rails:users:#{user_name}", 'id')
       @request_api_key = Carto::ApiKey.where(user_id: user_id, token: token).first
-    else # This is for keeping backwards compatibility until we remove api_key from user
-      api_key = params[:api_key]
-      user_name = CartoDB.extract_subdomain(request)
-      return unless $users_metadata.HMGET("rails:users:#{user_name}", "map_key").first == api_key
-      user_id = $users_metadata.HGET "rails:users:#{user_name}", 'id'
-      @request_api_key = Carto::User.find(user_id).api_keys.create_in_memory_master
     end
   end
 
   private
 
   AUTH_HEADER_RE = /basic\s(?<auth>\w+)/i
+
+  def authenticate_with_param(require_master_key)
+    begin
+      if (api_key = params[:api_key]) && api_key.present?
+        user_name = CartoDB.extract_subdomain(request)
+        user_id = $users_metadata.HGET "rails:users:#{user_name}", 'id'
+        api_key = Carto::ApiKey.where(user_id: user_id, token: api_key)
+        api_key = api_key.master if require_master_key
+        if api_key.exists?
+          user = ::User[api_key.first.user.id]
+          success!(user)
+        else
+          return fail!
+        end
+      else
+        return fail!
+      end
+    rescue
+      return fail!
+    end
+  end
+
+  def authenticate_with_header(require_master_key)
+    decoded_auth = Base64.decode64(base64_auth)
+    user_name, token = decoded_auth.split(':')
+    return fail! unless user_name == CartoDB.extract_subdomain(request)
+
+    user_id = $users_metadata.HGET("rails:users:#{user_name}", 'id')
+    api_key = Carto::ApiKey.where(user_id: user_id, token: token)
+    api_key = api_key.master if require_master_key
+    return fail! unless api_key.exists?
+
+    success!(::User[user_id])
+  rescue
+    fail!
+  end
 end
 
 Warden::Strategies.add(:auth_api) do
   include Carto::Api::AuthApiAuthentication
-
-  def valid?
-    base64_auth.present?
-  end
 
   # We don't want to store a session and send a response cookie
   def store?
@@ -367,7 +355,7 @@ Warden::Strategies.add(:any_auth_api) do
   include Carto::Api::AuthApiAuthentication
 
   def valid?
-    base64_auth.present?
+    params[:api_key].present? base64_auth.present?
   end
 
   # We don't want to store a session and send a response cookie
